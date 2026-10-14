@@ -12,41 +12,30 @@ Works with Claude Code, Codex, and other agents supported by the [`skills`](http
 
 ## Configure
 
-Point the scripts at your vault, either way:
-
-```bash
-export VAULT_SYNC_DIR="$HOME/path/to/vault"
-# or
-mkdir -p ~/.config/vault-sync
-echo '{"vault_dir": "~/path/to/vault"}' > ~/.config/vault-sync/profile.json
-```
+Nothing is required if you run inside the vault or Obsidian knows it. The vault is found in this order: `--vault` → `$VAULT_SYNC_DIR` → `vault_dir` in `~/.config/vault-sync/profile.json` → a vault above the current directory → the vault registered in Obsidian's config.
 
 The vault needs `_ai/CLAUDE.md` (schema/invariants) and `_ai/oracle_index.md` (router + `## ALL NOTES` catalog). See `skills/vault-sync/SKILL.md`.
 
 ## Use
 
-Ask your agent: `/vault-sync`, "vault lint", "recall ...", or the Korean triggers listed in `SKILL.md`. All bundled scripts are Python 3 stdlib only and run from any agent or a plain shell.
+Ask your agent: `/vault-sync`, "vault lint", "recall ...". Scripts are Python 3 stdlib only and run from any agent or a plain shell.
 
 ### Optional: auto-capture (any agent)
 
-`vault-capture.py` turns a finished session into new seed notes. It is not tied to one agent:
+`vault-capture.py` turns a finished session into new seed notes. Auto-detected, no setup:
 
-| Setting | Meaning |
-|---|---|
-| `VAULT_SYNC_LLM` | LLM backend: a preset (`claude`, `omp`, `pi`, `codex`, `gemini`) or any command that reads the prompt on stdin and prints the answer, e.g. `ollama run llama3.1`. Auto-detected from PATH if unset. |
-| `VAULT_SYNC_MODEL` | Model passed to the preset as `--model`. |
-| `VAULT_SYNC_LANG` | Language of generated notes (default `English`). |
-| `VAULT_SYNC_WORK_NOTES` | Optional extra directory indexed read-only by BM25. |
+- **LLM backend**: installed CLI among `claude`, `omp`, `pi`, `codex`, `gemini` (next one is tried if a call fails).
+- **Transcript**: newest session of those agents when none is given; format (Claude/omp/pi JSONL, Codex rollout, plain text) detected per file.
 
-Each of these can also be set in `~/.config/vault-sync/profile.json` (`llm`, `lang`).
+Overrides (env or `~/.config/vault-sync/profile.json`): `VAULT_SYNC_LLM`/`llm` (preset or any stdin→stdout command, e.g. `ollama run llama3.1`), `VAULT_SYNC_MODEL`, `VAULT_SYNC_LANG`/`lang` (default English), `VAULT_SYNC_WORK_NOTES` (extra read-only BM25 directory).
 
 ```bash
-python3 skills/vault-sync/scripts/vault-capture.py run --transcript session.md --dry-run
-python3 skills/vault-sync/scripts/vault-capture.py hook claude                  # Claude Code hook, stdin JSON
-python3 skills/vault-sync/scripts/vault-capture.py hook myagent /path/to/file   # any end-of-session hook
+python3 skills/vault-sync/scripts/vault-capture.py run --dry-run            # newest session, preview
+python3 skills/vault-sync/scripts/vault-capture.py hook claude              # Claude Code hook, stdin JSON
+python3 skills/vault-sync/scripts/vault-capture.py hook myagent [FILE]      # any end-of-session hook
 ```
 
-Transcripts: Claude Code / omp / pi JSONL, Codex rollout JSONL, or plain text/markdown. Presets run ephemerally (no session saved, no tools, no extensions). Verified end-to-end with `omp`; `pi`, `codex`, `gemini` presets use their documented non-interactive flags and were checked for flag acceptance only.
+Verified end-to-end with `omp` and stub backends; `pi`, `codex`, `gemini` presets were checked for flag acceptance only.
 
 ## Test
 

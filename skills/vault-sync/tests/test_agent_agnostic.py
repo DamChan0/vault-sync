@@ -19,36 +19,37 @@ def load(name, filename):
     return module
 
 
+vault_config = load("vault_config", "vault_config.py")
 llm = load("llm", "llm.py")
 capture = load("vault_capture", "vault-capture.py")
 
 
-class ResolveCommandTest(unittest.TestCase):
-    def resolve(self, env, which=lambda _: None, profile=None):
+class CandidatesTest(unittest.TestCase):
+    def candidates(self, env, which=lambda _: None, profile=None):
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(llm.shutil, "which", which), \
                 mock.patch.object(llm, "profile_value", lambda key: profile):
-            return llm.resolve_command()
+            return llm.candidates()
 
     def test_custom_command_is_split_and_used_verbatim(self):
-        self.assertEqual(self.resolve({"VAULT_SYNC_LLM": "ollama run 'llama 3'"}), ["ollama", "run", "llama 3"])
+        self.assertEqual(self.candidates({"VAULT_SYNC_LLM": "ollama run 'llama 3'"}), [["ollama", "run", "llama 3"]])
 
     def test_preset_model_flag_precedes_stdin_marker_for_codex(self):
-        cmd = self.resolve({"VAULT_SYNC_LLM": "codex", "VAULT_SYNC_MODEL": "gpt-x"})
+        cmd = self.candidates({"VAULT_SYNC_LLM": "codex", "VAULT_SYNC_MODEL": "gpt-x"})[0]
         self.assertEqual(cmd[:4], ["codex", "exec", "--model", "gpt-x"])
         self.assertEqual(cmd[-1], "-")
 
-    def test_autodetect_picks_first_installed_preset_in_order(self):
-        cmd = self.resolve({}, which=lambda name: "/bin/x" if name in ("pi", "codex") else None)
-        self.assertEqual(cmd[0], "pi")
+    def test_autodetect_lists_every_installed_preset_in_order(self):
+        cmds = self.candidates({}, which=lambda name: "/bin/x" if name in ("pi", "codex") else None)
+        self.assertEqual([c[0] for c in cmds], ["pi", "codex"])
 
     def test_profile_overrides_autodetect_but_env_overrides_profile(self):
-        self.assertEqual(self.resolve({}, which=lambda _: "/bin/x", profile="gemini")[0], "gemini")
-        self.assertEqual(self.resolve({"VAULT_SYNC_LLM": "omp"}, profile="gemini")[0], "omp")
+        self.assertEqual(self.candidates({}, which=lambda _: "/bin/x", profile="gemini")[0][0], "gemini")
+        self.assertEqual(self.candidates({"VAULT_SYNC_LLM": "omp"}, profile="gemini")[0][0], "omp")
 
     def test_no_backend_is_an_actionable_error(self):
         with self.assertRaisesRegex(RuntimeError, "VAULT_SYNC_LLM"):
-            self.resolve({})
+            self.candidates({})
 
 
 class CompleteTest(unittest.TestCase):
@@ -60,10 +61,71 @@ class CompleteTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"VAULT_SYNC_LLM": f"{sys.executable} -c {shlex.quote(script)}"}):
             self.assertEqual(llm.complete_json("prompt"), {"guard": "1"})
 
-    def test_nonzero_exit_raises(self):
+    def test_last_valid_object_wins_over_echoed_prompt_braces(self):
+        text = 'prompt echo {{"notes": []}} and {not json}\n{"notes": [1]}\n'
+        self.assertEqual(llm.last_json_object(text), {"notes": [1]})
+
+    def test_autodetected_backend_falls_back_when_first_fails(self):
+        bad = f"{sys.executable} -c 'import sys; sys.exit(3)'"
+        good = f"{sys.executable} -c 'import sys; sys.stdin.read(); print(1); print(\"{{}}\")'"
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(llm, "candidates", lambda: [shlex.split(bad), shlex.split(good)]):
+            self.assertEqual(llm.complete_json("x"), {})
+
+    def test_explicit_backend_failure_is_not_masked(self):
         with mock.patch.dict(os.environ, {"VAULT_SYNC_LLM": f"{sys.executable} -c 'import sys; sys.exit(3)'"}):
             with self.assertRaisesRegex(RuntimeError, "rc=3"):
-                llm.complete("x")
+                llm.complete_json("x")
+
+
+class VaultDiscoveryTest(unittest.TestCase):
+    def discover(self, cwd, home_files=None):
+        with tempfile.TemporaryDirectory() as home:
+            for rel, text in (home_files or {}).items():
+                path = Path(home) / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            cwd = cwd(Path(home)) if callable(cwd) else cwd
+            with mock.patch.dict(os.environ, {"HOME": home}, clear=True), \
+                    mock.patch.object(vault_config.Path, "cwd", classmethod(lambda cls: cwd)):
+                return vault_config._discover()
+
+    def test_vault_above_cwd_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "v/_ai").mkdir(parents=True)
+            (Path(tmp) / "v/sub/deep").mkdir(parents=True)
+            self.assertEqual(self.discover(Path(tmp) / "v/sub/deep"), Path(tmp) / "v")
+
+    def test_obsidian_registry_prefers_vault_sync_layout_then_recent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain, wired = Path(tmp, "plain"), Path(tmp, "wired")
+            plain.mkdir()
+            (wired / "_ai").mkdir(parents=True)
+            registry = json.dumps({"vaults": {
+                "a": {"path": str(plain), "ts": 9, "open": True},
+                "b": {"path": str(wired), "ts": 1},
+            }})
+            found = self.discover(Path(tmp), {".config/obsidian/obsidian.json": registry})
+            self.assertEqual(found, wired)
+
+    def test_nothing_found_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(self.discover(Path(tmp)))
+
+
+class LatestSessionTest(unittest.TestCase):
+    def test_newest_file_across_agents_with_harness_label(self):
+        with tempfile.TemporaryDirectory() as home:
+            old = Path(home, ".claude/projects/p/a.jsonl")
+            new = Path(home, ".codex/sessions/2026/10/14/rollout-x.jsonl")
+            for i, path in enumerate((old, new)):
+                path.parent.mkdir(parents=True)
+                path.write_text("{}")
+                os.utime(path, (1000 + i, 1000 + i))
+            with mock.patch.object(capture.Path, "home", classmethod(lambda cls: Path(home))):
+                self.assertEqual(capture.latest_session(), (new, "codex"))
+                new.unlink(); old.unlink()
+                self.assertIsNone(capture.latest_session())
 
 
 class LoadDialogueTest(unittest.TestCase):

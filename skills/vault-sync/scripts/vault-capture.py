@@ -8,8 +8,9 @@ for every write, then rebuilds the BM25 index.
 
 Entry points (harness = free-form label for the source agent):
   vault-capture.py hook claude              # Claude Code hook (stdin JSON), detaches
-  vault-capture.py hook HARNESS FILE [ID]   # any other agent/script, detaches
-  vault-capture.py run --transcript FILE [--session-id ID] [--harness H] [--dry-run] [--force]
+  vault-capture.py hook HARNESS [FILE [ID]] # any other agent/script, detaches
+  vault-capture.py run [--transcript FILE] [--session-id ID] [--harness H] [--dry-run] [--force]
+FILE defaults to the newest session of any known agent (claude, omp, pi, codex).
 
 Transcript formats (auto-detected): JSONL from Claude Code / omp / pi
 (`message.role`), Codex rollout JSONL (`payload.role`), or plain text/markdown.
@@ -121,13 +122,19 @@ def allowed_tags(vault: Path) -> set[str]:
     return set(re.findall(r"`([a-z0-9_-]+/[a-z0-9_/-]+)`", (vault / "_ai/tag_map.md").read_text()))
 
 
-def bm25(query: str, vault: Path) -> list[dict]:
-    if not (vault / ".vault-meta/bm25/index.json").exists():  # first capture in a fresh vault
-        subprocess.run([sys.executable, str(SCRIPTS / "vault-bm25.py"), "build"], check=True, capture_output=True)
-    out = subprocess.run(
-        [sys.executable, str(SCRIPTS / "vault-bm25.py"), "query", "--top", "3", query],
-        capture_output=True, text=True, check=True,
-    )
+def bm25(query: str) -> list[dict]:
+    """Top hits; builds the index on first use and rebuilds once if it is missing or stale."""
+    script = str(SCRIPTS / "vault-bm25.py")
+
+    def ask():
+        return subprocess.run([sys.executable, script, "query", "--top", "3", query], capture_output=True, text=True)
+
+    out = ask()
+    if out.returncode != 0:
+        if subprocess.run([sys.executable, script, "build"], capture_output=True).returncode != 0:
+            return []  # nothing indexable (empty vault): nothing can already cover it
+        out = ask()
+        out.check_returncode()
     return json.loads(out.stdout)
 
 
@@ -182,8 +189,8 @@ Return ONLY {{"verdict": "new"|"covered", "reason": "..."}}.
 """
 
 
-def is_covered(cand: dict, vault: Path) -> tuple[bool, str]:
-    hits = bm25(cand["query"] or cand["title"], vault)
+def is_covered(cand: dict) -> tuple[bool, str]:
+    hits = bm25(cand["query"] or cand["title"])
     if not hits:
         return False, "no BM25 hits"
     existing = "\n\n".join(
@@ -301,6 +308,7 @@ def run(transcript: Path, session_id: str, harness: str, dry_run: bool, force: b
 
     dialogue = load_dialogue(transcript)
     vault = load_vault_dir()
+    os.environ["VAULT_SYNC_DIR"] = str(vault)  # child scripts must act on the vault we resolved
     folders = writable_folders(vault)
     source = f"session {harness}:{session_id} ({transcript})"
     result = {"session": source, "dry_run": dry_run, "accepted": [], "rejected": [], "created": []}
@@ -315,7 +323,7 @@ def run(transcript: Path, session_id: str, harness: str, dry_run: bool, force: b
         for cand in extracted.get("notes", [])[:MAX_NOTES]:
             reason = validate(cand, vault, tags, folders)
             if reason is None:
-                covered, why = is_covered(cand, vault)
+                covered, why = is_covered(cand)
                 reason = f"already covered — {why}" if covered else None
                 if not covered:
                     cand["dedupe"] = why
@@ -331,6 +339,20 @@ def run(transcript: Path, session_id: str, harness: str, dry_run: bool, force: b
         state_file.write_text(json.dumps({"size": size, "at": _now().isoformat(),
                                           "created": result["created"]}))
     return 0
+
+
+SESSION_GLOBS = {  # where each known agent keeps session transcripts
+    "claude": ".claude/projects/*/*.jsonl",
+    "omp": ".omp/agent/sessions/*/*.jsonl",
+    "pi": ".pi/agent/sessions/*/*.jsonl",
+    "codex": ".codex/sessions/*/*/*/rollout-*.jsonl",
+}
+
+
+def latest_session() -> tuple[Path, str] | None:
+    """Newest session file across known agents, with its harness label."""
+    return max(((p, name) for name, pattern in SESSION_GLOBS.items() for p in Path.home().glob(pattern)),
+               key=lambda t: t[0].stat().st_mtime, default=None)
 
 
 def detach(transcript: str, session_id: str, harness: str) -> None:
@@ -350,10 +372,10 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     hook = sub.add_parser("hook")
     hook.add_argument("harness")
-    hook.add_argument("transcript", nargs="?")
+    hook.add_argument("transcript", nargs="?", help="default: newest session of any known agent")
     hook.add_argument("session_id", nargs="?")
     r = sub.add_parser("run")
-    r.add_argument("--transcript", required=True, type=Path)
+    r.add_argument("--transcript", type=Path, help="default: newest session of any known agent")
     r.add_argument("--session-id", help="default: transcript file stem")
     r.add_argument("--harness", default="generic")
     r.add_argument("--dry-run", action="store_true")
@@ -361,7 +383,16 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.cmd == "run":
-        return run(args.transcript, args.session_id or args.transcript.stem, args.harness, args.dry_run, args.force)
+        transcript, harness = args.transcript, args.harness
+        if transcript is None:
+            auto = latest_session()
+            if auto is None:
+                log("no transcript given and no known agent session found")
+                return 1
+            transcript = auto[0]
+            harness = auto[1] if harness == "generic" else harness
+        return run(transcript, args.session_id or transcript.stem, harness, args.dry_run, args.force)
+
     if args.harness == "claude":
         payload = json.load(sys.stdin)
         # idle_prompt is the only Notification type that means "user went idle".
@@ -369,8 +400,10 @@ def main() -> int:
             return 0
         transcript, session_id = payload.get("transcript_path"), payload.get("session_id")
     else:
-        transcript = args.transcript
-        session_id = args.session_id or (Path(transcript).stem if transcript else None)
+        transcript, session_id = args.transcript, args.session_id
+        if not transcript and (auto := latest_session()):
+            transcript = str(auto[0])
+        session_id = session_id or (Path(transcript).stem if transcript else None)
     if not transcript or not session_id or not Path(transcript).is_file():
         log(f"hook {args.harness}: no transcript ({transcript!r}); skip")
         return 0

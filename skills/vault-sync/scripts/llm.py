@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
 """Agent-agnostic one-shot LLM call for vault-sync's bundled scripts.
 
-vault-sync never assumes a particular coding agent. A backend is any command
-that reads the prompt on stdin and prints the model's answer on stdout.
+A backend is any command that reads the prompt on stdin and prints the answer
+on stdout. Nothing assumes a particular coding agent.
 
-Selection, first match wins:
-  1. $VAULT_SYNC_LLM
-  2. "llm" in ~/.config/vault-sync/profile.json
-  3. first preset whose CLI is on PATH (claude, omp, pi, codex, gemini)
+Selection:
+  - $VAULT_SYNC_LLM or profile "llm": exactly that backend (a preset name or a
+    command line such as 'ollama run llama3.1'); no fallback.
+  - otherwise: every preset whose CLI is on PATH, in PRESETS order; if one
+    fails (not logged in, quota, timeout) the next is tried.
 
-The value is either a preset name or a custom command line, e.g.
-  VAULT_SYNC_LLM='ollama run llama3.1'
-  VAULT_SYNC_LLM='my-wrapper --json'
-A custom command must read the prompt from stdin and write the answer to stdout.
-
-$VAULT_SYNC_MODEL picks a model for presets (passed as --model). Presets run
-ephemerally (no session saved, no tools, no extensions/hooks) from a temp cwd,
-with VAULT_CAPTURE_RUNNING=1 so any hook that reaches vault-capture.py exits
-immediately instead of recursing.
+$VAULT_SYNC_MODEL picks a model for presets (--model). Presets run ephemerally
+(no session, tools or extensions) from /tmp with VAULT_CAPTURE_RUNNING=1 so a
+hook that reaches vault-capture.py exits instead of recursing.
 """
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -32,12 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vault_config import profile_value  # noqa: E402
 
 GUARD_ENV = "VAULT_CAPTURE_RUNNING"
-LLM_ENV = "VAULT_SYNC_LLM"
-MODEL_ENV = "VAULT_SYNC_MODEL"
 TIMEOUT_S = 600
 
-# Verified flags: claude, omp, pi, codex, gemini each accept the prompt on stdin
-# in non-interactive mode. Detection order below follows this dict order.
+# Each preset takes the prompt on stdin in non-interactive mode.
 PRESETS = {
     "claude": ["claude", "-p", "--setting-sources", "", "--no-session-persistence", "--tools", ""],
     "omp": ["omp", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-rules"],
@@ -45,45 +36,64 @@ PRESETS = {
     "codex": ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-"],
     "gemini": ["gemini", "-p", ""],
 }
-# Model flag goes before the preset's trailing "-"/prompt arg where order matters.
 DEFAULT_MODEL = {"claude": "sonnet"}
-MODEL_INSERT_AT = {"codex": 2}  # after the `exec` subcommand; other presets: after the binary
+MODEL_INSERT_AT = {"codex": 2}  # after `exec`; other presets: right after the binary
 
 
-def resolve_command() -> list[str]:
-    spec = os.environ.get(LLM_ENV) or profile_value("llm")
-    if not spec:
-        spec = next((name for name, cmd in PRESETS.items() if shutil.which(cmd[0])), None)
-        if not spec:
-            raise RuntimeError(
-                f"no LLM backend: install one of {', '.join(PRESETS)} or set ${LLM_ENV} "
-                "to a command that reads the prompt on stdin and prints the answer"
-            )
-    if spec in PRESETS:
-        cmd = list(PRESETS[spec])
-        model = os.environ.get(MODEL_ENV) or DEFAULT_MODEL.get(spec)
-        if model:
-            at = MODEL_INSERT_AT.get(spec, 1)
-            cmd[at:at] = ["--model", model]
-        return cmd
-    return shlex.split(spec)
+def _preset_command(name: str) -> list[str]:
+    cmd = list(PRESETS[name])
+    model = os.environ.get("VAULT_SYNC_MODEL") or DEFAULT_MODEL.get(name)
+    if model:
+        at = MODEL_INSERT_AT.get(name, 1)
+        cmd[at:at] = ["--model", model]
+    return cmd
 
 
-def complete(prompt: str) -> str:
-    cmd = resolve_command()
+def candidates() -> list[list[str]]:
+    spec = os.environ.get("VAULT_SYNC_LLM") or profile_value("llm")
+    if spec:
+        return [_preset_command(spec) if spec in PRESETS else shlex.split(spec)]
+    found = [_preset_command(name) for name, cmd in PRESETS.items() if shutil.which(cmd[0])]
+    if not found:
+        raise RuntimeError(
+            f"no LLM backend: install one of {', '.join(PRESETS)} or set VAULT_SYNC_LLM "
+            "to a command that reads the prompt on stdin and prints the answer"
+        )
+    return found
+
+
+def _run(cmd: list[str], prompt: str) -> str:
     out = subprocess.run(
         cmd, input=prompt, capture_output=True, text=True, timeout=TIMEOUT_S,
         env={**os.environ, GUARD_ENV: "1"}, cwd="/tmp",
     )
     if out.returncode != 0:
-        raise RuntimeError(f"{cmd[0]} failed rc={out.returncode}: {out.stderr.strip()[:500]}")
+        raise RuntimeError(f"{cmd[0]} failed rc={out.returncode}: {out.stderr.strip()[:300]}")
     return out.stdout
 
 
-def complete_json(prompt: str):
-    """Return the first {...} object in the answer (agents often wrap JSON in prose or progress lines)."""
-    text = complete(prompt)
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
+def last_json_object(text: str):
+    """Last valid {...} in text. Agents add progress lines or echo the prompt around the answer."""
+    decoder, found, i = json.JSONDecoder(), None, text.find("{")
+    while i != -1:
+        try:
+            obj, end = decoder.raw_decode(text, i)
+            if isinstance(obj, dict):
+                found = obj
+            i = text.find("{", end)
+        except ValueError:
+            i = text.find("{", i + 1)
+    if found is None:
         raise RuntimeError(f"LLM returned no JSON object: {text[:300]!r}")
-    return json.loads(m.group(0))
+    return found
+
+
+def complete_json(prompt: str):
+    """First backend that yields a JSON object wins; raises the last error if none do."""
+    error = None
+    for cmd in candidates():
+        try:
+            return last_json_object(_run(cmd, prompt))
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            error = RuntimeError(f"{cmd[0]}: {e}")
+    raise error

@@ -34,45 +34,56 @@ def profile_value(key):
     return value if isinstance(value, str) and value else None
 
 
+def _fail(message):
+    print(f"ERR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _is_vault(path):
+    return (path / "_ai").is_dir() or (path / ".obsidian").is_dir()
+
+
+def _discover():
+    """Vault above the cwd, else one registered in Obsidian's own config. None if not found."""
+    for parent in (Path.cwd(), *Path.cwd().parents):
+        if _is_vault(parent):
+            return parent
+    for config in (Path("~/.config/obsidian/obsidian.json"),
+                   Path("~/Library/Application Support/obsidian/obsidian.json"),
+                   Path("~/.var/app/md.obsidian.Obsidian/config/obsidian/obsidian.json"),
+                   Path(os.environ.get("APPDATA", "~") + "/obsidian/obsidian.json")):
+        try:
+            vaults = json.loads(config.expanduser().read_text(encoding="utf-8"))["vaults"].values()
+        except (OSError, ValueError, KeyError, AttributeError):
+            continue
+        found = [(v.get("open", False), v.get("ts", 0), Path(v["path"]))
+                 for v in vaults if isinstance(v, dict) and v.get("path") and Path(v["path"]).is_dir()]
+        # Prefer a vault already laid out for vault-sync (_ai/), then the open/most recent one.
+        found.sort(key=lambda t: ((t[2] / "_ai").is_dir(), t[0], t[1]), reverse=True)
+        if found:
+            return found[0][2]
+    return None
+
+
 def load_vault_dir(override=None):
     """Return the vault root as a Path.
 
-    `override` (e.g. a --vault CLI flag) takes precedence over the profile,
-    for read-only inspection of another host's vault. Otherwise reads
-    $VAULT_SYNC_DIR, then vault_dir from ~/.config/vault-sync/profile.json.
-    A missing or malformed profile fails loud (stderr + non-zero exit)
-    rather than silently no-op'ing.
+    Order: `override` (--vault flag) → $VAULT_SYNC_DIR → profile `vault_dir` →
+    a vault above the cwd → Obsidian's registered vaults. An explicitly
+    configured path that is not a directory fails loud rather than falling
+    through to a different vault.
     """
-    if override:
-        vault_dir = os.path.expanduser(override)
-        if not Path(vault_dir).is_dir():
-            print(f"ERR: --vault {override!r} is not a directory", file=sys.stderr)
-            sys.exit(1)
-        return Path(vault_dir)
-    env_dir = os.environ.get(ENV_VAR)
-    if env_dir:
-        resolved = Path(os.path.expanduser(env_dir))
-        if not resolved.is_dir():
-            print(f"ERR: ${ENV_VAR}={env_dir!r} is not a directory", file=sys.stderr)
-            sys.exit(1)
-        return resolved
-    try:
-        profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
-        vault_dir = profile["vault_dir"]
-    except FileNotFoundError:
-        print(f"ERR: no vault configured: set ${ENV_VAR} or create {PROFILE_PATH} with {{'vault_dir': '~/path/to/vault'}}", file=sys.stderr)
-        sys.exit(1)
-    except (json.JSONDecodeError, KeyError, TypeError) as error:
-        print(f"ERR: malformed profile {PROFILE_PATH}: {error}", file=sys.stderr)
-        sys.exit(1)
-    if not isinstance(vault_dir, str) or not vault_dir:
-        print(f"ERR: profile.json vault_dir must be a non-empty string, got {vault_dir!r}", file=sys.stderr)
-        sys.exit(1)
-    resolved = Path(os.path.expanduser(vault_dir))
-    if not resolved.is_dir():
-        print(f"ERR: profile vault_dir {vault_dir!r} is not a directory", file=sys.stderr)
-        sys.exit(1)
-    return resolved
+    explicit = override or os.environ.get(ENV_VAR) or profile_value("vault_dir")
+    if explicit:
+        path = Path(os.path.expanduser(explicit))
+        if not path.is_dir():
+            _fail(f"vault path {explicit!r} is not a directory")
+        return path
+    found = _discover()
+    if found is None:
+        _fail(f"no vault found: run inside one, pass --vault, set ${ENV_VAR}, "
+              f"or put {{'vault_dir': '~/path/to/vault'}} in {PROFILE_PATH}")
+    return found
 
 
 def default_indexed_dirs(vault_dir, exclude=()):
