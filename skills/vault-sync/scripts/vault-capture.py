@@ -6,14 +6,17 @@ auto-apply grant): it only CREATES new managed notes, never overwrites, never
 touches user folders, appends an ALL NOTES catalog row and a `_ai/log.md` entry
 for every write, then rebuilds the BM25 index.
 
-Entry points:
-  vault-capture.py hook claude      # Claude Code hook (stdin JSON), detaches
-  vault-capture.py hook omp FILE ID # omp extension, detaches
-  vault-capture.py run --transcript FILE --session-id ID --harness H [--dry-run] [--force]
+Entry points (harness = free-form label for the source agent):
+  vault-capture.py hook claude              # Claude Code hook (stdin JSON), detaches
+  vault-capture.py hook HARNESS FILE [ID]   # any other agent/script, detaches
+  vault-capture.py run --transcript FILE [--session-id ID] [--harness H] [--dry-run] [--force]
 
-Recursion guard: the capture itself runs `claude -p` with VAULT_CAPTURE_RUNNING=1,
-no setting sources (no hooks) and no session persistence; every entry point
-exits immediately when that variable is set.
+Transcript formats (auto-detected): JSONL from Claude Code / omp / pi
+(`message.role`), Codex rollout JSONL (`payload.role`), or plain text/markdown.
+
+LLM backend: llm.py (any agent CLI or custom stdin→stdout command). Recursion
+guard: it runs the backend with VAULT_CAPTURE_RUNNING=1, ephemerally; every
+entry point exits immediately when that variable is set.
 """
 import argparse
 import datetime
@@ -26,12 +29,16 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from vault_config import load_vault_dir  # noqa: E402
+from vault_config import load_vault_dir, profile_value  # noqa: E402
+from llm import GUARD_ENV, complete_json  # noqa: E402
 
-GUARD_ENV = "VAULT_CAPTURE_RUNNING"
 STATE_DIR = Path.home() / ".local/state/vault-capture"
 SCRIPTS = Path(__file__).resolve().parent
-KST = datetime.timezone(datetime.timedelta(hours=9))
+LANG = os.environ.get("VAULT_SYNC_LANG") or profile_value("lang") or "English"  # language of generated note text
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now().astimezone()
 # Managed knowledge folders are the vault's numbered top-level dirs (NN_name);
 # anything else (user folders, Templates, control plane) is off limits.
 MANAGED_FOLDER_RE = re.compile(r"^\d\d_")
@@ -42,12 +49,14 @@ def writable_folders(vault: Path) -> tuple[str, ...]:
 MAX_NOTES = 3
 TRANSCRIPT_CHARS = 90_000
 MIN_DIALOGUE_CHARS = 2_000
-MODEL = "sonnet"
+# Context an agent injects into user turns; not part of the conversation.
+_INJECTED_PREFIXES = ("# AGENTS.md instructions", "<environment_context>", "<user_instructions>",
+                      "<permissions", "<skills_instructions>", "<collaboration_mode>")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_]{2,60}$")
 
 
 def log(msg: str) -> None:
-    print(f"[vault-capture {datetime.datetime.now(KST):%H:%M:%S}] {msg}", file=sys.stderr, flush=True)
+    print(f"[vault-capture {_now():%H:%M:%S}] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------- transcript
@@ -57,27 +66,52 @@ def _text_of(content) -> str:
         return content
     if not isinstance(content, list):
         return ""
-    return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return "\n".join(
+        b.get("text", "") for b in content
+        if isinstance(b, dict) and b.get("type") in ("text", "input_text", "output_text")
+    )
 
 
 _INJECTED = re.compile(r"<system-reminder>.*?</system-reminder>|--- BEGIN `_ai/oracle_index.md`.*?--- END router ---", re.S)
 
 
+def _role_content(entry):
+    msg = entry.get("message")  # Claude Code, omp, pi
+    if isinstance(msg, dict):
+        return msg.get("role"), msg.get("content")
+    payload = entry.get("payload")  # Codex rollout
+    if entry.get("type") == "response_item" and isinstance(payload, dict) and payload.get("type") == "message":
+        return payload.get("role"), payload.get("content")
+    return None, None
+
+
 def load_dialogue(path: Path) -> str:
-    """User/assistant prose only; tool calls/results and injected context dropped."""
-    turns = []
-    for line in path.read_text(errors="replace").splitlines():
+    """User/assistant prose only; tool calls/results and injected context dropped.
+
+    A file with no recognizable JSONL turns is taken as a plain-text transcript.
+    """
+    raw = path.read_text(errors="replace")
+    turns, parsed_any = [], False
+    for line in raw.splitlines():
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        msg = entry.get("message")
-        if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
+        if not isinstance(entry, dict):
             continue
-        text = _INJECTED.sub("", _text_of(msg.get("content"))).strip()
-        if text:
-            turns.append(f"### {msg['role'].upper()}\n{text}")
-    dialogue = "\n\n".join(turns)
+        parsed_any = True
+        role, content = _role_content(entry)
+        if role not in ("user", "assistant"):
+            continue
+        text = _INJECTED.sub("", _text_of(content)).strip()
+        if text and not text.startswith(_INJECTED_PREFIXES):
+            turns.append(f"### {role.upper()}\n{text}")
+    if turns:
+        dialogue = "\n\n".join(turns)
+    elif parsed_any:
+        dialogue = ""
+    else:
+        dialogue = raw.strip()
     return dialogue[-TRANSCRIPT_CHARS:]
 
 
@@ -87,7 +121,9 @@ def allowed_tags(vault: Path) -> set[str]:
     return set(re.findall(r"`([a-z0-9_-]+/[a-z0-9_/-]+)`", (vault / "_ai/tag_map.md").read_text()))
 
 
-def bm25(query: str) -> list[dict]:
+def bm25(query: str, vault: Path) -> list[dict]:
+    if not (vault / ".vault-meta/bm25/index.json").exists():  # first capture in a fresh vault
+        subprocess.run([sys.executable, str(SCRIPTS / "vault-bm25.py"), "build"], check=True, capture_output=True)
     out = subprocess.run(
         [sys.executable, str(SCRIPTS / "vault-bm25.py"), "query", "--top", "3", query],
         capture_output=True, text=True, check=True,
@@ -95,21 +131,11 @@ def bm25(query: str) -> list[dict]:
     return json.loads(out.stdout)
 
 
-def claude_json(prompt: str):
-    env = {**os.environ, GUARD_ENV: "1"}
-    out = subprocess.run(
-        ["claude", "-p", "--model", MODEL, "--setting-sources", "", "--no-session-persistence", "--tools", ""],
-        input=prompt, capture_output=True, text=True, env=env, timeout=600, cwd="/tmp",
-    )
-    if out.returncode != 0:
-        raise RuntimeError(f"claude -p failed rc={out.returncode}: {out.stderr.strip()[:500]}")
-    m = re.search(r"\{.*\}", out.stdout, re.S)
-    if not m:
-        raise RuntimeError(f"claude -p returned no JSON object: {out.stdout[:300]!r}")
-    return json.loads(m.group(0))
+def llm_json(prompt: str):
+    return complete_json(prompt)
 
 
-EXTRACT_PROMPT = """You curate an Obsidian knowledge vault (Korean body, English keywords).
+EXTRACT_PROMPT = """You curate an Obsidian knowledge vault ({lang} body, English keywords).
 Below are (1) the vault's router listing every existing note with its keywords,
 (2) the allowed tag vocabulary, (3) a finished agent session transcript.
 
@@ -125,12 +151,12 @@ Return ONLY a JSON object:
   "folder": one of {folders},
   "slug": "snake_case filename without .md (tickets: ticket_<KEY> e.g. ticket_ESE123)",
   "title": "short title",
-  "aliases": ["..."], "keywords": ["EN and KO search words"],
+  "aliases": ["..."], "keywords": ["search words in English and {lang}"],
   "tags": [only from allowed vocabulary],
   "type": "source|entity|concept",
-  "summary": "one-line Korean description for the catalog",
+  "summary": "one-line {lang} description for the catalog",
   "query": "BM25 query (English keywords) to find an existing note on the same topic",
-  "body": "Korean markdown body: facts with evidence (file:line, commands, outputs seen in the session); mark unverified as ❓ 추정. No frontmatter."
+  "body": "{lang} markdown body: facts with evidence (file:line, commands, outputs seen in the session); mark unverified claims with a leading ❓. No frontmatter."
 }}]}}
 
 === (1) ROUTER ===
@@ -156,14 +182,14 @@ Return ONLY {{"verdict": "new"|"covered", "reason": "..."}}.
 """
 
 
-def is_covered(cand: dict) -> tuple[bool, str]:
-    hits = bm25(cand["query"] or cand["title"])
+def is_covered(cand: dict, vault: Path) -> tuple[bool, str]:
+    hits = bm25(cand["query"] or cand["title"], vault)
     if not hits:
         return False, "no BM25 hits"
     existing = "\n\n".join(
         f"--- {h['path']} ---\n{Path(h['absolute_path']).read_text(errors='replace')[:5000]}" for h in hits
     )
-    verdict = claude_json(DEDUPE_PROMPT.format(
+    verdict = llm_json(DEDUPE_PROMPT.format(
         candidate=json.dumps({k: cand[k] for k in ("title", "body")}, ensure_ascii=False), existing=existing,
     ))
     return verdict.get("verdict") != "new", f"{verdict.get('verdict')}: {verdict.get('reason', '')} (vs {[h['path'] for h in hits]})"
@@ -211,7 +237,7 @@ def render_note(cand: dict, source: str, today: str) -> str:
         f"updated: {today}\n"
         f"sources: {_ylist([source])}\n"
         "---\n\n"
-        "> [!note] idle 자동 캡처 (vault-capture) — 세션 transcript에서 추출, 검토 전 seed.\n\n"
+        "> [!note] Auto-captured (vault-capture) from a session transcript; unreviewed seed.\n\n"
         f"{cand['body'].strip()}\n"
     )
 
@@ -230,12 +256,12 @@ def add_catalog_rows(oracle: Path, rows: list[tuple[str, str]]) -> None:
             last_row = max(i for i in range(start, end) if lines[i].startswith("|"))
             lines.insert(last_row + 1, row)
         except (StopIteration, ValueError):
-            lines += ["", f"### {folder}", "| 노트 | 경로 | 설명 | keywords |", "|---|---|---|---|", row]
+            lines += ["", f"### {folder}", "| Note | Path | Description | keywords |", "|---|---|---|---|", row]
     oracle.write_text("\n".join(lines) + "\n")
 
 
 def apply(vault: Path, notes: list[dict], source: str) -> list[str]:
-    now = datetime.datetime.now(KST)
+    now = _now()
     today = now.strftime("%Y-%m-%d")
     created, rows = [], []
     for cand in notes:
@@ -248,10 +274,10 @@ def apply(vault: Path, notes: list[dict], source: str) -> list[str]:
         rows.append((cand["folder"], f"| [[{cand['slug']}]] | {rel} | {cand['summary'].replace('|', '/')} | {kw} |"))
     add_catalog_rows(vault / "_ai/oracle_index.md", rows)
     entry = (
-        f"\n### {now:%Y-%m-%d %H:%M} KST | capture | idle 자동 캡처: "
+        f"\n### {now:%Y-%m-%d %H:%M} {now:%Z} | capture | auto-capture: "
         f"{'; '.join(c['title'] for c in notes)} | {len(created) + 1} pages\n"
         f"- Created: {', '.join(created)}\n"
-        f"- Updated: _ai/oracle_index.md (ALL NOTES 행 {len(rows)}개)\n"
+        f"- Updated: _ai/oracle_index.md (ALL NOTES: {len(rows)} row(s))\n"
         f"- Sources: {source}\n"
     )
     with open(vault / "_ai/log.md", "a") as f:
@@ -282,14 +308,14 @@ def run(transcript: Path, session_id: str, harness: str, dry_run: bool, force: b
         result["rejected"].append({"reason": f"dialogue too short ({len(dialogue)} chars)"})
     else:
         tags = allowed_tags(vault)
-        extracted = claude_json(EXTRACT_PROMPT.format(
-            max_notes=MAX_NOTES, folders=list(folders), tags=" ".join(sorted(tags)),
+        extracted = llm_json(EXTRACT_PROMPT.format(
+            max_notes=MAX_NOTES, lang=LANG, folders=list(folders), tags=" ".join(sorted(tags)),
             router=(vault / "_ai/oracle_index.md").read_text(), dialogue=dialogue,
         ))
         for cand in extracted.get("notes", [])[:MAX_NOTES]:
             reason = validate(cand, vault, tags, folders)
             if reason is None:
-                covered, why = is_covered(cand)
+                covered, why = is_covered(cand, vault)
                 reason = f"already covered — {why}" if covered else None
                 if not covered:
                     cand["dedupe"] = why
@@ -302,7 +328,7 @@ def run(transcript: Path, session_id: str, harness: str, dry_run: bool, force: b
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not dry_run:
-        state_file.write_text(json.dumps({"size": size, "at": datetime.datetime.now(KST).isoformat(),
+        state_file.write_text(json.dumps({"size": size, "at": _now().isoformat(),
                                           "created": result["created"]}))
     return 0
 
@@ -323,19 +349,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     hook = sub.add_parser("hook")
-    hook.add_argument("harness", choices=["claude", "omp"])
+    hook.add_argument("harness")
     hook.add_argument("transcript", nargs="?")
     hook.add_argument("session_id", nargs="?")
     r = sub.add_parser("run")
     r.add_argument("--transcript", required=True, type=Path)
-    r.add_argument("--session-id", required=True)
-    r.add_argument("--harness", required=True, choices=["claude", "omp"])
+    r.add_argument("--session-id", help="default: transcript file stem")
+    r.add_argument("--harness", default="generic")
     r.add_argument("--dry-run", action="store_true")
     r.add_argument("--force", action="store_true", help="ignore the per-session state file")
     args = ap.parse_args()
 
     if args.cmd == "run":
-        return run(args.transcript, args.session_id, args.harness, args.dry_run, args.force)
+        return run(args.transcript, args.session_id or args.transcript.stem, args.harness, args.dry_run, args.force)
     if args.harness == "claude":
         payload = json.load(sys.stdin)
         # idle_prompt is the only Notification type that means "user went idle".
@@ -343,7 +369,8 @@ def main() -> int:
             return 0
         transcript, session_id = payload.get("transcript_path"), payload.get("session_id")
     else:
-        transcript, session_id = args.transcript, args.session_id
+        transcript = args.transcript
+        session_id = args.session_id or (Path(transcript).stem if transcript else None)
     if not transcript or not session_id or not Path(transcript).is_file():
         log(f"hook {args.harness}: no transcript ({transcript!r}); skip")
         return 0

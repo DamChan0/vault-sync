@@ -3,14 +3,14 @@
 
 Runs the existing catalog check (vault-catalog-check.py) plus broken
 wikilinks, tag drift, frontmatter gaps and stale claims over the managed
-folders (10_* .. 70_*), and adds:
+folders (numbered folders, NN_name), and adds:
   (a) missing concepts: unresolved [[wikilinks]], and frontmatter keywords
       shared by >= MIN_KEYWORD_NOTES notes that have no page of that name;
-  (b) web-fill gap candidates: `[!gap]` callouts, `❓ 추정` lines, seed notes;
+  (b) web-fill gap candidates: `[!gap]` callouts, `❓` (unverified) lines, seed notes;
 and lists due reviews (vault-review.py logic).
 
 Never writes inside the vault. Output: <out-dir>/YYYY-MM-DD.md
-(default ~/work-notes/vault-lint/).
+(default ~/.local/state/vault-sync/lint/).
 
 Usage:
   vault-lint-report.py [--vault PATH] [--out-dir DIR] [--today YYYY-MM-DD]
@@ -27,7 +27,7 @@ from pathlib import Path
 import vault_config
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MANAGED_DIR_RE = re.compile(r"^[1-7]0_")
+MANAGED_DIR_RE = re.compile(r"^\d\d_")
 FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|\Z)", re.S)
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
 CODE_FENCE_RE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
@@ -79,7 +79,7 @@ def registered_tags(vault):
     return set(re.findall(r"`([a-z\-]+/[a-z0-9\-]+(?:/[a-z0-9\-]+)?)`", text))
 
 
-def section(title, lines, empty="없음"):
+def section(title, lines, empty="None"):
     out = [f"## {title}", ""]
     out.extend(lines if lines else [f"- {empty}"])
     out.append("")
@@ -89,7 +89,7 @@ def section(title, lines, empty="없음"):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--vault")
-    parser.add_argument("--out-dir", default="~/work-notes/vault-lint")
+    parser.add_argument("--out-dir", default="~/.local/state/vault-sync/lint")
     parser.add_argument("--today")
     args = parser.parse_args()
 
@@ -122,13 +122,13 @@ def main():
         text = path.read_text(encoding="utf-8", errors="replace")
         match = FRONTMATTER_RE.match(text)
         if not match:
-            fm_gaps.append(f"- `{rel}`: frontmatter 없음")
+            fm_gaps.append(f"- `{rel}`: no frontmatter")
             continue
         fm = match.group(1)
         body = text[match.end():]
         missing = [k for k in REQUIRED_KEYS if not re.search(rf"^{k}:", fm, re.M)]
         if missing:
-            fm_gaps.append(f"- `{rel}`: 누락 {', '.join(missing)}")
+            fm_gaps.append(f"- `{rel}`: missing {', '.join(missing)}")
         if tags_ok is not None:
             for tag in list_field(fm, "tags"):
                 if "/" in tag and tag not in tags_ok:
@@ -161,35 +161,35 @@ def main():
     unscheduled = [n for n in notes_scanned if n.next_review is None and n.status != "superseded"]
 
     out = [f"# Vault lint report — {today.isoformat()}", "",
-           f"읽기 전용 점검. 대상: 관리 폴더 10_~70_ {len(notes)}개 노트. vault 파일은 수정하지 않음.", ""]
+           f"Read-only check. Scope: numbered folders (NN_name), {len(notes)} notes. Vault files are not modified.", ""]
     out += section(
         "Catalog invariant (vault-catalog-check.py)",
-        [f"- exit {catalog.returncode} ({'OK' if catalog.returncode == 0 else '위반'})"]
+        [f"- exit {catalog.returncode} ({'OK' if catalog.returncode == 0 else 'violation'})"]
         + [f"  {line}" for line in (catalog.stdout + catalog.stderr).strip().splitlines()[:MAX_LIST]],
     )
     out += section(
-        f"Due reviews ({len(due)}건, 미스케줄 {len(unscheduled)}건)",
+        f"Due reviews ({len(due)}, unscheduled {len(unscheduled)})",
         [f"- {n.next_review.isoformat()} [{n.status}] `{n.rel}` — {n.title}" for n in due[:MAX_LIST]]
-        + ([f"- … 외 {len(due) - MAX_LIST}건"] if len(due) > MAX_LIST else []),
+        + ([f"- … and {len(due) - MAX_LIST} more"] if len(due) > MAX_LIST else []),
     )
     out += section(
-        f"Broken wikilinks ({len(broken)}) / (a) 페이지 없는 개념 후보",
+        f"Broken wikilinks ({len(broken)}) / (a) concept candidates without a page",
         [f"- [[{k}]] ← {', '.join(f'`{r}`' for r in sorted(v)[:3])}" for k, v in sorted(broken.items())[:MAX_LIST]],
     )
     out += section(
-        f"(a) 여러 노트에 반복되나 전용 페이지 없는 keyword (≥{MIN_KEYWORD_NOTES}개 노트, 상위 {MAX_LIST})",
-        [f"- `{k}` — {len(v)}개 노트" for k, v in missing_concepts[:MAX_LIST]],
+        f"(a) keywords repeated across notes with no dedicated page (>= {MIN_KEYWORD_NOTES} notes, top {MAX_LIST})",
+        [f"- `{k}` — {len(v)} notes" for k, v in missing_concepts[:MAX_LIST]],
     )
     out += section(
-        f"(b) 웹/원본 확인으로 채울 gap 후보 ([!gap]·❓ 추정 {len(gaps)}줄, seed 노트 {len(seeds)}개)",
+        f"(b) gap candidates to fill via web/source check ([!gap]·❓ {len(gaps)} lines, {len(seeds)} seed notes)",
         gaps[:MAX_LIST] + [f"- seed: `{r}`" for r in seeds[:MAX_LIST]],
     )
-    out += section(f"Stale (stable, updated > {STALE_WEEKS}주 전) {len(stale)}건",
+    out += section(f"Stale (stable, updated > {STALE_WEEKS} weeks ago) {len(stale)}",
                    [f"- {d.isoformat()} `{r}`" for d, r in sorted(stale)[:MAX_LIST]]
-                   + ([f"- … 외 {len(stale) - MAX_LIST}건"] if len(stale) > MAX_LIST else []))
+                   + ([f"- … and {len(stale) - MAX_LIST} more"] if len(stale) > MAX_LIST else []))
     out += section(f"Tag drift ({len(tag_drift)})",
                    [f"- `{t}` ← {', '.join(f'`{r}`' for r in v[:3])}" for t, v in sorted(tag_drift.items())[:MAX_LIST]])
-    out += section(f"Frontmatter 누락 ({len(fm_gaps)})", fm_gaps[:MAX_LIST])
+    out += section(f"Frontmatter gaps ({len(fm_gaps)})", fm_gaps[:MAX_LIST])
 
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)

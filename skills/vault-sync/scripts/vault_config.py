@@ -25,6 +25,15 @@ CONTROL_PLANE_DIRS = frozenset({
 })
 
 
+def profile_value(key):
+    """Optional string setting from profile.json; None if the file or key is absent."""
+    try:
+        value = json.loads(PROFILE_PATH.read_text(encoding="utf-8")).get(key)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
 def load_vault_dir(override=None):
     """Return the vault root as a Path.
 

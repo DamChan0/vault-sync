@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """vault-review.py — resurfacing: list managed notes whose review is due.
 
-Managed notes (top-level folders 10_* .. 70_*) carry `next_review: YYYY-MM-DD`
+Managed notes (top-level numbered folders, NN_name) carry `next_review: YYYY-MM-DD`
 and optionally `review_every: <N>d|w|m` in frontmatter. Without `review_every`
 the interval comes from `status`: seed 2w, developing 1m, stable 3m;
 `superseded` is never scheduled.
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import vault_config
 
-MANAGED_DIR_RE = re.compile(r"^[1-7]0_")
+MANAGED_DIR_RE = re.compile(r"^\d\d_")
 FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|\Z)", re.S)
 DEFAULT_EVERY = {"seed": "2w", "developing": "1m", "stable": "3m"}
 INTERVAL_RE = re.compile(r"^(\d+)\s*([dwm])$")

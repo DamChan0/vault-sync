@@ -59,10 +59,11 @@ def init_vault(vault_override=None, exclude=()):
     LOCK_PATH = META_DIR / ".bm25.lock"
 
 
-# Session spec/diagnosis/handoff notes live outside the vault on purpose
-# (core rule: ~/work-notes/<slug>/). They are indexed read-only under this
-# prefix so hits are visibly not vault notes and nothing is copied in.
-WORK_NOTES_ROOT = Path.home() / "work-notes"
+# Optional: a directory of session spec/diagnosis/handoff notes kept outside the
+# vault, set via $VAULT_SYNC_WORK_NOTES (e.g. ~/work-notes). Indexed read-only
+# under this prefix so hits are visibly not vault notes and nothing is copied in.
+_work_notes_env = os.environ.get("VAULT_SYNC_WORK_NOTES")
+WORK_NOTES_ROOT = Path(os.path.expanduser(_work_notes_env)) if _work_notes_env else None
 EXTERNAL_PREFIX = "work-notes:"
 
 
@@ -211,7 +212,7 @@ def discover_notes():
 
 
 def discover_work_notes():
-    if not WORK_NOTES_ROOT.is_dir():
+    if WORK_NOTES_ROOT is None or not WORK_NOTES_ROOT.is_dir():
         return
     for path in sorted(WORK_NOTES_ROOT.rglob("*.md")):
         rel = path.relative_to(WORK_NOTES_ROOT)
@@ -222,6 +223,8 @@ def discover_work_notes():
 
 def is_current_indexed_note(rel):
     if is_external(rel):
+        if WORK_NOTES_ROOT is None:  # external notes disabled; entries from an older index are stale
+            return False
         rel_path = Path(rel[len(EXTERNAL_PREFIX):])
         path = WORK_NOTES_ROOT / rel_path
         return (

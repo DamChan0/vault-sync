@@ -17,17 +17,34 @@ Only `_ai/oracle_index.md` is injected at session start — not `hot.md` — so 
 
 ## Scripts
 
-Five bundled scripts live at `~/.claude/skills/vault-sync/scripts/` (path used by `npx skills add` for Claude Code; adjust if your agent installs skills elsewhere):
+`<skill_dir>` = the directory containing this SKILL.md (e.g. `~/.claude/skills/vault-sync`, `~/.codex/skills/vault-sync`, `~/.agents/skills/vault-sync` — wherever your agent installed it). Five bundled scripts live in `<skill_dir>/scripts/` (Python 3 stdlib only; they work from any agent or a plain shell):
 
 | Script | Role |
 |---|---|
-| `vault_config.py` | Shared import (`load_vault_dir`, `default_indexed_dirs`); not invoked directly. |
+| `vault_config.py` | Shared import (`load_vault_dir`, `default_indexed_dirs`, `profile_value`); not invoked directly. |
+| `llm.py` | Agent-agnostic LLM call used by capture; not invoked directly (see "Optional automation"). |
 | `vault-bm25.py` | Build/query/stats the BM25 index at `<vault>/.vault-meta/bm25/index.json`. |
 | `vault-graph.py` | Build/query the wikilink+frontmatter graph at `<vault>/.vault-meta/graphify/graph.json`. |
 | `vault-source-query.py` | Read-only search over explicitly named session/source files (no vault write, no discovery). |
 | `vault-catalog-check.py` | Audit the catalog invariant above; exit 0 = holds, 1 = violations found. |
+| `vault-capture.py` | Optional: file a finished session's durable knowledge into the vault as new seed notes. |
+| `vault-review.py` | Optional: list notes due for review (`next_review` frontmatter); `--bump` reschedules. |
+| `vault-lint-report.py` | Optional: read-only lint report (broken links, due reviews, gaps) written outside the vault. |
+| `vault-search-eval.py` | Optional: recall@k over your own `--cases cases.json` query→note list. |
 
 All of them resolve `<vault>` from `$VAULT_SYNC_DIR` or the vault-sync profile by default; pass `--vault <path>` to any of them to read-only inspect a different host's vault instead.
+
+### Optional automation (any agent)
+
+`vault-capture.py` needs an LLM backend: any command that reads a prompt on stdin and prints the answer. Presets for `claude`, `omp`, `pi`, `codex`, `gemini` are auto-detected from PATH; override with `VAULT_SYNC_LLM` (preset name or any command, e.g. `ollama run llama3.1`) or `"llm"` in `~/.config/vault-sync/profile.json`; `VAULT_SYNC_MODEL` picks a model; `VAULT_SYNC_LANG` (or `"lang"`) sets the note language (default English). Transcripts: Claude Code / omp / pi JSONL, Codex rollout JSONL, or plain text/markdown.
+
+```bash
+python3 <skill_dir>/scripts/vault-capture.py run --transcript session.md --dry-run   # preview
+python3 <skill_dir>/scripts/vault-capture.py hook claude                              # Claude Code hook (stdin JSON)
+python3 <skill_dir>/scripts/vault-capture.py hook myagent /path/to/transcript          # any agent's end-of-session hook
+```
+
+Set `VAULT_SYNC_WORK_NOTES=/dir` to also index a directory of out-of-vault notes read-only in BM25.
 
 ## Authority
 
@@ -63,7 +80,7 @@ Retrieval order: **oracle_index (이미 주입됨) → graph → BM25 → folder
 When `oracle_index.md`'s router doesn't cover a question, query the local graph before BM25:
 
 ```bash
-python3 ~/.claude/skills/vault-sync/scripts/vault-graph.py query "<vault>/.vault-meta/graphify/graph.json" "<question>" --top 5
+python3 <skill_dir>/scripts/vault-graph.py query "<vault>/.vault-meta/graphify/graph.json" "<question>" --top 5
 ```
 
 The graph is a deterministic, derived index of Markdown wikilinks and frontmatter (`aliases`, `keywords`, `tags`, `related`). It makes no LLM calls, uses no embeddings, and never replaces notes, `oracle_index.md`, or BM25.
@@ -71,7 +88,7 @@ The graph is a deterministic, derived index of Markdown wikilinks and frontmatte
 If the graph doesn't resolve it, fall back to BM25:
 
 ```bash
-python3 ~/.claude/skills/vault-sync/scripts/vault-bm25.py query "<question>" --top 5
+python3 <skill_dir>/scripts/vault-bm25.py query "<question>" --top 5
 ```
 
 Read matched body excerpts with their original line ranges — a metadata-only match is a route, not proof the body supports the claim. If the index is missing or corrupt, report it and fall back to a focused folder scan; don't rebuild silently during Recall/Lint/Resume.
@@ -79,8 +96,8 @@ Read matched body excerpts with their original line ranges — a metadata-only m
 Rebuild both after managed-note or schema writes (Ingest Step 5 does this):
 
 ```bash
-python3 ~/.claude/skills/vault-sync/scripts/vault-graph.py build --exclude "<comma-separated do-not-touch folders from _ai/CLAUDE.md>"
-python3 ~/.claude/skills/vault-sync/scripts/vault-bm25.py --exclude "<comma-separated do-not-touch folders from _ai/CLAUDE.md>" build
+python3 <skill_dir>/scripts/vault-graph.py build --exclude "<comma-separated do-not-touch folders from _ai/CLAUDE.md>"
+python3 <skill_dir>/scripts/vault-bm25.py --exclude "<comma-separated do-not-touch folders from _ai/CLAUDE.md>" build
 ```
 
 ## Bounded source recovery
@@ -88,7 +105,7 @@ python3 ~/.claude/skills/vault-sync/scripts/vault-bm25.py --exclude "<comma-sepa
 If evidence is still missing after oracle/graph/BM25/folder scan, recover it only from exact, explicitly identified source files — never a directory scan of `~/.claude`, `~/.codex`, `~/.omp`, or another agent's live files:
 
 ```bash
-python3 ~/.claude/skills/vault-sync/scripts/vault-source-query.py query "<missing requirement>" --source /absolute/path/to/selected-file --top 5
+python3 <skill_dir>/scripts/vault-source-query.py query "<missing requirement>" --source /absolute/path/to/selected-file --top 5
 ```
 
 - Repeat `--source` only for individually, explicitly selected files; the flag is not proof of user consent — establish scope from the live request first.
@@ -103,8 +120,9 @@ Process new raw sources → synthesize → update existing pages cross-cuttingly
 ### Step 1 — Discover
 
 ```bash
-ls -la ~/.claude/session-data/*.tmp
-ls -la ~/.claude/projects/*/memory/
+# Replace with where YOUR agent keeps session transcripts / memory files, if any.
+# Example (Claude Code): ls -la ~/.claude/projects/*/*.jsonl
+# Any exported transcript or notes file works: ls -la /path/to/exports/*.md
 ```
 
 Compare against the last ingest timestamp in `_ai/log.md`. Identify sources newer than that.
@@ -147,8 +165,8 @@ For each fact:
 - `<new/tag>` — <의미>
 
 ### 출처
-- session: <path under ~/.claude/session-data/>
-- memory: <path under ~/.claude/projects/*/memory/>
+- session: <path to the transcript or export used>
+- memory: <path to the agent memory file used, if any>
 ```
 
 Get explicit user approval before every ingest write. This includes managed notes and `oracle_index`/`tag_map`/`topic_graph` updates. Note deletion/merge-delete, user-owned (do-not-touch) folders, and bulk changes (>20 notes) require explicit approval with the affected paths and consequences called out. When in doubt, wait.
@@ -178,7 +196,7 @@ After approval:
 Run the catalog check first — a non-zero exit means you are not done:
 
 ```bash
-python3 ~/.claude/skills/vault-sync/scripts/vault-catalog-check.py
+python3 <skill_dir>/scripts/vault-catalog-check.py
 ```
 
 Then audit wikilinks (target stems + aliases):
@@ -331,7 +349,7 @@ for d in MANAGED:
 
 #### B9. Catalog coverage (MEDIUM — the catalog invariant)
 ```bash
-python3 ~/.claude/skills/vault-sync/scripts/vault-catalog-check.py
+python3 <skill_dir>/scripts/vault-catalog-check.py
 ```
 Run it and propose a catalog row (see the Ingest Step 5 row format) for every note it reports missing, plus fixes for any broken `oracle_index.md` links it reports. Preview the proposed rows/fixes and wait for approval before writing — this is a lint finding, not an auto-apply.
 
