@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -22,6 +24,41 @@ def load(name, filename):
 vault_config = load("vault_config", "vault_config.py")
 llm = load("llm", "llm.py")
 capture = load("vault_capture", "vault-capture.py")
+vault_init = load("vault_init", "vault-init.py")
+
+
+class InitTest(unittest.TestCase):
+    def test_init_is_idempotent_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "v"
+            vault.mkdir()
+            (vault / "_ai").mkdir()
+            (vault / "_ai/log.md").write_text("mine")
+            with mock.patch("builtins.print"):
+                vault_init.init(vault)
+                vault_init.init(vault)
+            self.assertEqual((vault / "_ai/log.md").read_text(), "mine")
+            self.assertTrue((vault / "_ai/oracle_index.md").is_file())
+
+    def test_fresh_skeleton_accepts_capture_catalog_rows_and_is_managed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp)
+            with mock.patch("builtins.print"):
+                vault_init.init(vault)
+            capture.add_catalog_rows(vault / "_ai/oracle_index.md", [("10_notes", "| [[a]] | 10_notes/a.md | d | k |")])
+            self.assertIn("| [[a]] |", (vault / "_ai/oracle_index.md").read_text())
+            self.assertEqual(capture.writable_folders(vault), ("10_notes",))
+            self.assertIn("workflow/ops", capture.allowed_tags(vault))
+
+    def test_context_is_silent_without_a_vault(self):
+        vc = vault_init.vault_config
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HOME": tmp}, clear=True), \
+                mock.patch.object(vc, "profile_value", lambda key: None), \
+                mock.patch.object(vc.Path, "cwd", classmethod(lambda cls: Path(tmp))), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(vault_init.context(), 0)
+        self.assertEqual(out.getvalue(), "")
 
 
 class CandidatesTest(unittest.TestCase):

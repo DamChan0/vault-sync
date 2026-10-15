@@ -11,6 +11,8 @@ Keep an Obsidian vault as persistent, compounding knowledge: synthesize at inges
 
 `<skill_dir>` = directory containing this SKILL.md (wherever your agent installed it). `<vault>` is found automatically, first match wins: `--vault <path>` → `$VAULT_SYNC_DIR` → `vault_dir` in `~/.config/vault-sync/profile.json` → a vault above the current directory (has `_ai/` or `.obsidian/`) → the vault registered in Obsidian's own config (the one with `_ai/` if several). Never hardcode a path.
 
+**No vault yet?** Run `python3 <skill_dir>/scripts/vault-init.py init` (in the target directory, or with `--vault DIR`), then continue.
+
 **Schema**: read `<vault>/_ai/CLAUDE.md` first. It names the invariants, the managed knowledge folders, and the do-not-touch folders (user-owned; never write there or treat them as knowledge folders). `MANAGED` = top-level folders minus `_ai`, `.obsidian`, `.trash`, `.vault-meta`, `Templates`, and the do-not-touch folders. Compute it from that file; don't hardcode.
 
 **Catalog invariant**: every knowledge note is reachable from `_ai/oracle_index.md` (QUICK ROUTES or the `## ALL NOTES` catalog). Only that file is shown to a fresh session, so an uncatalogued note effectively does not exist.
@@ -19,6 +21,7 @@ Keep an Obsidian vault as persistent, compounding knowledge: synthesize at inges
 
 | Script | Role |
 |---|---|
+| `vault-init.py` | `init` — create the `_ai/` skeleton + `10_notes/` (never overwrites); `context` — print the router for a session-start hook. |
 | `vault-bm25.py` | `build` / `query "<q>" --top 5` / `stats` — BM25 index at `<vault>/.vault-meta/bm25/`. |
 | `vault-graph.py` | `build` / `query` — wikilink + frontmatter graph (deterministic, no LLM). |
 | `vault-source-query.py` | Search explicitly named transcript/source files (`--source FILE`, never a directory scan). |
@@ -80,7 +83,7 @@ File back only if the answer synthesized ≥2 notes, helps a cold future session
 
 `vault-capture.py` turns a finished session into new seed notes (never overwrites; only creates in numbered `NN_name` folders; adds the catalog row and log entry; skips what the vault already covers).
 
-Everything is auto-detected; override only if needed:
+Everything is auto-detected; override only if needed. To run it automatically and have the agent see the router at session start, see "Make it automatic" in the repo README (Claude Code hooks, omp extension, cron/AGENTS.md for any other agent).
 - **LLM backend**: tries installed presets (`claude`, `omp`, `pi`, `codex`, `gemini`) in order and falls back to the next one if a call fails. Override: `VAULT_SYNC_LLM` or profile `llm` = preset name or any command reading the prompt on stdin (e.g. `ollama run llama3.1`); `VAULT_SYNC_MODEL` picks the model.
 - **Transcript**: Claude Code / omp / pi JSONL, Codex rollout JSONL, or plain text — detected per file. Without `--transcript`, `run` uses the newest session file from those agents.
 - **Language** of generated notes: `VAULT_SYNC_LANG` / profile `lang` (default English).
