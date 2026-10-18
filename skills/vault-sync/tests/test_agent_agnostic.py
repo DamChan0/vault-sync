@@ -61,6 +61,74 @@ class InitTest(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
 
+class InstallHooksTest(unittest.TestCase):
+    def run_install(self, settings, **kw):
+        with mock.patch("builtins.print"):
+            return vault_init.install_claude(settings, **kw)
+
+    def commands(self, settings, event):
+        groups = json.loads(settings.read_text())["hooks"][event]
+        return [h["command"] for g in groups for h in g["hooks"]]
+
+    def test_merges_without_touching_existing_hooks_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            settings.write_text(json.dumps({"model": "x", "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "mine"}]}]}}))
+            self.assertTrue(self.run_install(settings))
+            self.assertFalse(self.run_install(settings))
+            data = json.loads(settings.read_text())
+            self.assertEqual(data["model"], "x")
+            self.assertEqual(len(self.commands(settings, "SessionStart")), 2)
+            self.assertIn("mine", self.commands(settings, "SessionStart"))
+            self.assertEqual(len(self.commands(settings, "SessionEnd")), 1)
+            self.assertEqual(data["hooks"]["Notification"][0]["matcher"], "idle_prompt")
+            self.assertEqual(len(list(Path(tmp).glob("settings.json.bak-*"))), 1)
+
+    def test_existing_recall_or_capture_hook_is_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            settings.write_text(json.dumps({"hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "python3 ~/h/vault-recall-compact.py"}]}],
+                "SessionEnd": [{"hooks": [{"type": "command", "command": "python3 /x/vault-capture.py hook claude"}]}],
+            }}))
+            self.run_install(settings)
+            self.assertEqual(len(self.commands(settings, "SessionStart")), 1)
+            self.assertEqual(len(self.commands(settings, "SessionEnd")), 1)
+            self.assertEqual(len(self.commands(settings, "Notification")), 1)
+
+    def test_invalid_json_aborts_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            settings.write_text("{not json")
+            with self.assertRaises(SystemExit):
+                self.run_install(settings)
+            self.assertEqual(settings.read_text(), "{not json")
+            self.assertEqual(list(Path(tmp).glob("*.bak-*")), [])
+
+    def test_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            self.assertTrue(self.run_install(settings, dry_run=True))
+            self.assertFalse(settings.exists())
+
+    def test_omp_extension_is_copied_once_and_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("builtins.print"):
+            ext = Path(tmp) / "extensions"
+            self.assertTrue(vault_init.install_omp(ext))
+            self.assertIn("vault-init.py", (ext / "vault-sync.ts").read_text())
+            (ext / "vault-sync.ts").write_text("edited")
+            self.assertFalse(vault_init.install_omp(ext))
+            self.assertEqual((ext / "vault-sync.ts").read_text(), "edited")
+
+    def test_pin_vault_keeps_other_profile_keys(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("builtins.print"):
+            profile = Path(tmp) / "profile.json"
+            profile.write_text(json.dumps({"lang": "ko"}))
+            with mock.patch.object(vault_init.vault_config, "PROFILE_PATH", profile):
+                vault_init.pin_vault(Path("/v"))
+            self.assertEqual(json.loads(profile.read_text()), {"lang": "ko", "vault_dir": "/v"})
+
+
 class CandidatesTest(unittest.TestCase):
     def candidates(self, env, which=lambda _: None, profile=None):
         with mock.patch.dict(os.environ, env, clear=True), \

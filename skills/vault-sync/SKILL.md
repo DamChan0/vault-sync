@@ -11,7 +11,7 @@ Keep an Obsidian vault as persistent, compounding knowledge: synthesize at inges
 
 `<skill_dir>` = directory containing this SKILL.md (wherever your agent installed it). `<vault>` is found automatically, first match wins: `--vault <path>` → `$VAULT_SYNC_DIR` → `vault_dir` in `~/.config/vault-sync/profile.json` → a vault above the current directory (has `_ai/` or `.obsidian/`) → the vault registered in Obsidian's own config (the one with `_ai/` if several). Never hardcode a path.
 
-**No vault yet?** Run `python3 <skill_dir>/scripts/vault-init.py init` (in the target directory, or with `--vault DIR`), then continue.
+**No vault yet?** Run `python3 <skill_dir>/scripts/vault-init.py init` (in the target directory, or with `--vault DIR`), then `vault-init.py install-hooks --vault <dir>` so agents see the router at session start and finished sessions are captured automatically.
 
 **Schema**: read `<vault>/_ai/CLAUDE.md` first. It names the invariants, the managed knowledge folders, and the do-not-touch folders (user-owned; never write there or treat them as knowledge folders). `MANAGED` = top-level folders minus `_ai`, `.obsidian`, `.trash`, `.vault-meta`, `Templates`, and the do-not-touch folders. Compute it from that file; don't hardcode.
 
@@ -21,7 +21,7 @@ Keep an Obsidian vault as persistent, compounding knowledge: synthesize at inges
 
 | Script | Role |
 |---|---|
-| `vault-init.py` | `init` — create the `_ai/` skeleton + `10_notes/` (never overwrites); `context` — print the router for a session-start hook. |
+| `vault-init.py` | `init` — create the `_ai/` skeleton + `10_notes/` (never overwrites); `context` — print the router for a session-start hook; `install-hooks` — wire router injection + auto-capture into Claude Code / omp. |
 | `vault-bm25.py` | `build` / `query "<q>" --top 5` / `stats` — BM25 index at `<vault>/.vault-meta/bm25/`. |
 | `vault-graph.py` | `build` / `query` — wikilink + frontmatter graph (deterministic, no LLM). |
 | `vault-source-query.py` | Search explicitly named transcript/source files (`--source FILE`, never a directory scan). |
