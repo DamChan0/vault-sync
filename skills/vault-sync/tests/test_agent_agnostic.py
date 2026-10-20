@@ -128,6 +128,48 @@ class InstallHooksTest(unittest.TestCase):
                 vault_init.pin_vault(Path("/v"))
             self.assertEqual(json.loads(profile.read_text()), {"lang": "ko", "vault_dir": "/v"})
 
+    def test_discovered_vault_is_pinned_for_hooks_outside_vault(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("builtins.print"):
+            home = Path(tmp)
+            vault = home / "existing-vault"
+            (vault / "_ai").mkdir(parents=True)
+            profile = home / ".config/vault-sync/profile.json"
+            vc = vault_init.vault_config
+            with mock.patch.object(vault_init.Path, "home", classmethod(lambda cls: home)), \
+                    mock.patch.object(vc, "load_vault_dir", return_value=vault), \
+                    mock.patch.object(vc, "PROFILE_PATH", profile):
+                vault_init.install_hooks(["omp"], None, dry_run=True)
+                self.assertFalse(profile.exists())
+                self.assertFalse((home / ".omp").exists())
+                vault_init.install_hooks(["omp"], None)
+                self.assertEqual(json.loads(profile.read_text())["vault_dir"], str(vault))
+                self.assertTrue((home / ".omp/agent/extensions/vault-sync.ts").is_file())
+
+
+class CaptureScopeTest(unittest.TestCase):
+    def test_explicit_existing_scope_excludes_user_and_numbered_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp)
+            for name in ("memory", "10_notes", "personal"):
+                (vault / name).mkdir()
+            with mock.patch.object(capture, "profile_value", return_value="memory"):
+                self.assertEqual(capture.writable_folders(vault), ("memory",))
+                candidate = {"folder": "personal", "slug": "private_note", "title": "Private",
+                             "summary": "Not managed", "body": "Do not write", "type": "concept"}
+                self.assertEqual(capture.validate(candidate, vault, set(), capture.writable_folders(vault)),
+                                 "folder 'personal' not writable")
+
+    def test_invalid_control_plane_traversal_missing_and_symlink_scopes_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp)
+            (vault / "_ai").mkdir()
+            (vault / "memory").mkdir()
+            (vault / "linked").symlink_to(vault / "memory", target_is_directory=True)
+            for name in ("_ai", ".", "../outside", "memory/child", "missing", "linked", ", "):
+                with self.subTest(name=name), mock.patch.object(capture, "profile_value", return_value=name):
+                    with self.assertRaises(ValueError):
+                        capture.writable_folders(vault)
+
 
 class CandidatesTest(unittest.TestCase):
     def candidates(self, env, which=lambda _: None, profile=None):

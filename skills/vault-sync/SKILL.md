@@ -17,6 +17,14 @@ Keep an Obsidian vault as persistent, compounding knowledge: synthesize at inges
 
 **Catalog invariant**: every knowledge note is reachable from `_ai/oracle_index.md` (QUICK ROUTES or the `## ALL NOTES` catalog). Only that file is shown to a fresh session, so an uncatalogued note effectively does not exist.
 
+### First-use activation (existing vaults too)
+
+Installing with `skills add` copies files; it does not execute hooks. On the first write-authorized invocation, after reading the schema, preview and run `python3 <skill_dir>/scripts/vault-init.py install-hooks --vault <vault>` as part of the authorized setup. Do not skip this for an existing vault. It pins the resolved vault and idempotently installs hooks for detected Claude Code / omp homes. Explicit read-only/recall/lint requests never install or change hooks; report the setup needed instead.
+
+Before enabling capture, check its write scope: by default only numbered `NN_name` folders are writable. For an existing layout, set the local `~/.config/vault-sync/profile.json` string `capture_folders` to a comma-separated list of existing top-level folders explicitly designated writable by the schema and authorized by the user (e.g. `memory`). Never infer permission from arbitrary folder names or rewrite the schema to bypass it. Set `lang` to the vault's language if needed. If automatic saving is not authorized, obtain approval before enabling capture.
+
+Verify by running `install-hooks --vault <vault> --dry-run` again: it must report existing hooks/profile, not additions. Run `context --vault <vault>` to verify the router resolves. Report that the host agent must reload/restart before installed hooks take effect; copying an extension is not proof that this live session loaded it.
+
 ## Scripts (`<skill_dir>/scripts/`, Python 3 stdlib only)
 
 | Script | Role |

@@ -236,8 +236,8 @@ def install_hooks(agents: list[str], vault: Path | None, dry_run: bool = False) 
     if not agents:
         print("no ~/.claude or ~/.omp found; pass --agent claude|omp")
         return 1
-    if vault:
-        pin_vault(vault.expanduser().resolve(), dry_run)
+    resolved = vault_config.load_vault_dir(str(vault) if vault else None).resolve()
+    pin_vault(resolved, dry_run)
     for agent in agents:
         if agent == "claude":
             install_claude(home / ".claude/settings.json", dry_run)

@@ -21,6 +21,10 @@ python3 $S/vault-init.py install-hooks --vault ~/my-vault        # router at ses
 
 Restart the agent session, then ask anything; it sees the vault router first and finished sessions are filed as new notes. Already have a vault? Skip `init`; it needs `_ai/oracle_index.md` with a `## ALL NOTES` section and `_ai/tag_map.md`.
 
+`skills add` only copies skill files: it cannot activate hooks by itself. On the first write-authorized skill invocation, the agent now runs the idempotent hook installer for existing vaults too. Read-only requests never change setup. Restart/reload the host agent after activation; re-running `install-hooks --dry-run` should report `keep`, and `context` should print your router.
+
+Existing non-numbered layouts can opt in schema-approved writable folders using `"capture_folders": "memory"` in `~/.config/vault-sync/profile.json` (comma-separated top-level names, existing real directories only; control-plane and symlink folders are rejected). Without this setting only numbered folders are writable. This is an explicit write-scope grant, not permission to capture into arbitrary personal folders. Set `"lang": "Korean"` for a Korean vault.
+
 ## Configure
 
 Nothing is required if you run inside the vault or Obsidian knows it. The vault is found in this order: `--vault` → `$VAULT_SYNC_DIR` → `vault_dir` in `~/.config/vault-sync/profile.json` → a vault above the current directory → the vault registered in Obsidian's config.
@@ -52,7 +56,7 @@ Verified end-to-end with `omp` and stub backends; `pi`, `codex`, `gemini` preset
 
 Two halves: the agent **sees the router** at session start, and finished sessions **update the vault**. Skill instructions alone only apply once the skill is invoked, so wire these once per agent.
 
-`vault-init.py install-hooks [--vault DIR] [--agent claude|omp] [--dry-run]` does it for **Claude Code** and **omp** (default: whichever of `~/.claude`, `~/.omp` exists). It merges into `~/.claude/settings.json` (timestamped backup, existing hooks untouched, an event that already runs a vault-sync/recall command is skipped), copies the omp extension without overwriting, and with `--vault` pins the vault in `~/.config/vault-sync/profile.json`. Idempotent; `--dry-run` previews.
+`vault-init.py install-hooks [--vault DIR] [--agent claude|omp] [--dry-run]` does it for **Claude Code** and **omp** (default: whichever of `~/.claude`, `~/.omp` exists). It resolves and pins the vault in `~/.config/vault-sync/profile.json` even without `--vault`, merges into `~/.claude/settings.json` (timestamped backup, existing hooks untouched, an event that already runs a vault-sync/recall command is skipped), and copies the omp extension without overwriting. Idempotent; `--dry-run` previews without writing.
 
 What it adds (verified: the router reaches the model and it answers from it):
 

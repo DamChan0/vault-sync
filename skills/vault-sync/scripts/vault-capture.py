@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from vault_config import load_vault_dir, profile_value  # noqa: E402
+from vault_config import CONTROL_PLANE_DIRS, load_vault_dir, profile_value  # noqa: E402
 from llm import GUARD_ENV, complete_json  # noqa: E402
 
 STATE_DIR = Path.home() / ".local/state/vault-capture"
@@ -40,13 +40,26 @@ LANG = os.environ.get("VAULT_SYNC_LANG") or profile_value("lang") or "English"  
 
 def _now() -> datetime.datetime:
     return datetime.datetime.now().astimezone()
-# Managed knowledge folders are the vault's numbered top-level dirs (NN_name);
-# anything else (user folders, Templates, control plane) is off limits.
+# Numbered folders are the default. Existing vaults may explicitly opt in
+# their schema's managed folders through the local capture_folders profile.
 MANAGED_FOLDER_RE = re.compile(r"^\d\d_")
 
 
 def writable_folders(vault: Path) -> tuple[str, ...]:
-    return tuple(sorted(p.name for p in vault.iterdir() if p.is_dir() and MANAGED_FOLDER_RE.match(p.name)))
+    configured = profile_value("capture_folders")
+    if configured:
+        names = tuple(sorted(set(name.strip() for name in configured.split(",") if name.strip())))
+        for name in names:
+            target = vault / name
+            if (not name or name.startswith(".") or name in CONTROL_PLANE_DIRS
+                    or "/" in name or "\\" in name or not target.is_dir()
+                    or target.is_symlink() or target.resolve().parent != vault.resolve()):
+                raise ValueError(f"invalid managed capture folder: {name!r}")
+        if not names:
+            raise ValueError("capture_folders must name at least one managed folder")
+        return names
+    return tuple(sorted(p.name for p in vault.iterdir()
+                        if p.is_dir() and not p.is_symlink() and MANAGED_FOLDER_RE.match(p.name)))
 MAX_NOTES = 3
 TRANSCRIPT_CHARS = 90_000
 MIN_DIALOGUE_CHARS = 2_000
